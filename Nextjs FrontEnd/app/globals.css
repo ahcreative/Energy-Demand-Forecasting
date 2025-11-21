@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.app-container {
+  padding: 20px;
+  background-color: #f8f9fa;
+  min-height: 100vh;
+}
+
+.header {
+  padding: 15px 0;
+  border-bottom: 1px solid #ddd;
+}
+
+.metric-card {
+  text-align: center;
+  background-color: #f8f9fa;
+  border-left: 5px solid #007bff;
+}
+
+.metric-card h3 {
+  font-size: 2rem;
+  font-weight: bold;
+  color: #007bff;
+}
+
+.metric-card p {
+  color: #666;
+  margin-bottom: 0;
+}
+
+.cluster-stats .color-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 5px;
+}
+
+.model-info {
+  background-color: #f8f9fa;
+  padding: 15px;
+  border-radius: 5px;
+}
+
+.model-info h6 {
+  margin-top: 15px;
+  margin-bottom: 5px;
+  font-weight: 600;
+}
+
+.model-info ul {
+  padding-left: 20px;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .app-container {
+    padding: 10px;
+  }
+
+  .metric-card h3 {
+    font-size: 1.5rem;
+  }
+}
