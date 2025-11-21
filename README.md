@@ -187,10 +187,3 @@ Your Name - [@ahcreative](https://github.com/ahcreative)
 * Research papers on time series forecasting
 
 ---
-
-⭐ If you find this project helpful, please give it a star on [GitHub](https://github.com/ahcreative/energy-demand-forecasting)
-Made with ❤️ for sustainable energy management
-
-
-Do you want me to do that?
-```
