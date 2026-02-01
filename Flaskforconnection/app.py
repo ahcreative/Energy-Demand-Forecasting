@@ -15,7 +15,11 @@ logger = logging.getLogger(__name__)
 from electricity_forecaster import ElectricityDemandForecaster, run_forecasting_pipeline
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(
+    app,
+    resources={r"/api/*": {"origins": "http://localhost:3000"}},
+    supports_credentials=True
+)
 
 # Configuration
 MODEL_DIR = 'models'
@@ -36,24 +40,36 @@ def initialize():
     """Initialize the application by loading forecaster and data"""
     global forecaster, cities, data
 
+    # Skip initialization for some endpoints
+    if forecaster is not None:
+        return  # already initialized
+
     try:
-        # Create forecaster instance
-        forecaster = ElectricityDemandForecaster(data_path=DATA_PATH)
+        # Create forecaster instance if not exists
+        if forecaster is None:
+            forecaster = ElectricityDemandForecaster(data_path=DATA_PATH)
 
-        # Load data
-        data = forecaster.load_data()
+            # Load data
+            try:
+                data = forecaster.load_data()
+                logger.info(f"Data loaded successfully with shape: {data.shape}")
+            except Exception as e:
+                logger.error(f"Data loading error: {str(e)}", exc_info=True)
 
-        # Extract cities list
-        cities = data['city'].unique().tolist()
+            # Extract cities list
+            if data is not None:
+                cities = data['city'].unique().tolist()
+                logger.info(f"Found {len(cities)} cities in the dataset")
 
-        # Load pre-trained models if they exist
-        if os.path.exists(MODEL_DIR) and any(file.endswith('.pkl') for file in os.listdir(MODEL_DIR)):
-            forecaster.load_models(directory=MODEL_DIR)
-            logger.info("Pre-trained models loaded successfully")
-        else:
-            logger.info("No pre-trained models found")
-
-        logger.info(f"Initialization complete. Found {len(cities)} cities in the dataset")
+            # Load pre-trained models if they exist
+            if os.path.exists(MODEL_DIR) and any(file.endswith('.pkl') for file in os.listdir(MODEL_DIR)):
+                try:
+                    forecaster.load_models(directory=MODEL_DIR)
+                    logger.info("Pre-trained models loaded successfully")
+                except Exception as e:
+                    logger.error(f"Error loading models: {str(e)}", exc_info=True)
+            else:
+                logger.info("No pre-trained models found")
     except Exception as e:
         logger.error(f"Initialization error: {str(e)}", exc_info=True)
 
@@ -61,10 +77,10 @@ def initialize():
 @app.route('/api/cities', methods=['GET'])
 def get_cities():
     """Get list of available cities"""
-    global cities
+    global cities, data
 
     try:
-        if cities is None:
+        if cities is None or len(cities) == 0:
             # If cities list is not yet loaded, load it now
             if data is None:
                 try:
@@ -86,16 +102,21 @@ def get_cities():
 def get_models():
     """Get list of available forecast models"""
     try:
+        global forecaster
+
+        # Check if forecaster is initialized
+        if forecaster is None:
+            forecaster = ElectricityDemandForecaster(data_path=DATA_PATH)
+
         # Check if forecaster has models loaded
-        if forecaster and hasattr(forecaster, 'models') and forecaster.models:
+        available_models = []
+        if hasattr(forecaster, 'models') and forecaster.models:
             available_models = list(forecaster.models.keys())
         else:
             # Check for model files in the models directory
             if os.path.exists(MODEL_DIR):
                 available_models = [f.split('.')[0] for f in os.listdir(MODEL_DIR)
                                     if f.endswith('.pkl') and not f.startswith('scaler')]
-            else:
-                available_models = []
 
         # If no models found, list the available model types
         if not available_models:
@@ -114,25 +135,41 @@ def get_models():
 def get_forecast():
     """Generate forecast for a city"""
     try:
-        data = request.json
+        global forecaster, data
+
+        # Log incoming request
+        logger.info(f"Forecast request received: {request.json}")
+
+        # Ensure forecaster is initialized
+        if forecaster is None:
+            forecaster = ElectricityDemandForecaster(data_path=DATA_PATH)
+
+        # Load data if not already loaded
+        if data is None or forecaster.data is None:
+            data = forecaster.load_data()
+
+        request_data = request.json
 
         # Validate required parameters
         required_params = ['city', 'start_date', 'end_date', 'model']
-        if not all(param in data for param in required_params):
-            return jsonify({'error': 'Missing required parameters'}), 400
+        if not all(param in request_data for param in required_params):
+            missing_params = [p for p in required_params if p not in request_data]
+            return jsonify({'error': f'Missing required parameters: {missing_params}'}), 400
 
-        city = data['city'].lower()
-        model_name = data['model']
-        start_date = data['start_date']
-        end_date = data['end_date']
+        city = request_data['city'].lower()
+        model_name = request_data['model']
+        start_date = request_data['start_date']
+        end_date = request_data['end_date']
 
-        # Load data if not already loaded
-        if forecaster.data is None:
-            forecaster.load_data()
+        logger.info(f"Processing forecast for {city} using {model_name} from {start_date} to {end_date}")
 
         # Convert dates
-        start_date = pd.to_datetime(start_date)
-        end_date = pd.to_datetime(end_date)
+        try:
+            start_date = pd.to_datetime(start_date)
+            end_date = pd.to_datetime(end_date)
+        except Exception as e:
+            logger.error(f"Date parsing error: {str(e)}", exc_info=True)
+            return jsonify({'error': f'Invalid date format: {str(e)}'}), 400
 
         # Filter data for the selected city and date range
         df = forecaster.data.copy()
@@ -148,17 +185,28 @@ def get_forecast():
         if len(df) == 0:
             return jsonify({'error': 'No data available for selected city and date range'}), 404
 
-        # Check if the requested model exists
-        if not forecaster.models or model_name not in forecaster.models:
-            # If model doesn't exist, try to load it
-            try:
-                model_path = os.path.join(MODEL_DIR, f"{model_name}.pkl")
-                if os.path.exists(model_path):
+        logger.info(f"Found {len(df)} data points for forecast")
+
+        # Check if the requested model exists or needs to be trained
+        if not hasattr(forecaster, 'models'):
+            forecaster.models = {}
+
+        if model_name not in forecaster.models:
+            # Try to load the model
+            model_path = os.path.join(MODEL_DIR, f"{model_name}.pkl")
+
+            if os.path.exists(model_path):
+                try:
+                    logger.info(f"Loading model from {model_path}")
                     forecaster.models[model_name] = joblib.load(model_path)
-                else:
-                    # Train a simple model for demonstration
-                    logger.info(f"Model {model_name} not found. Training a new one.")
-                    X, y = forecaster.prepare_features(city=city)
+                except Exception as e:
+                    logger.error(f"Error loading model: {str(e)}", exc_info=True)
+                    return jsonify({'error': f'Error loading model: {str(e)}'}), 500
+            else:
+                # Train a simple model
+                logger.info(f"Model {model_name} not found. Training a new one.")
+                try:
+                    X, y = forecaster.prepare_features(city=city if city != 'all' else None)
                     X_train, X_test, y_train, y_test = forecaster.train_test_split_by_time(X, y)
                     forecaster.scale_features()
 
@@ -183,76 +231,118 @@ def get_forecast():
                         # Default to linear regression
                         forecaster.train_linear_regression()
                         model_name = 'linear'
-            except Exception as e:
-                logger.error(f"Error loading/training model {model_name}: {str(e)}")
-                return jsonify({'error': f"Unable to load or train model {model_name}"}), 500
+                except Exception as e:
+                    logger.error(f"Error training model: {str(e)}", exc_info=True)
+                    return jsonify({'error': f'Error training model: {str(e)}'}), 500
 
         # Generate features for the test data
-        test_features = df.copy()
+        try:
+            test_features = df.copy()
 
-        # Add lag and rolling features
-        lag_periods = [1, 24, 48, 168]  # Previous hour, day, 2 days, week
-        for lag in lag_periods:
-            test_features[f'demand_lag_{lag}'] = test_features['demand'].shift(lag)
+            # Add temporal features if they don't exist
+            if 'hour' not in test_features.columns:
+                test_features['hour'] = test_features['local_time'].dt.hour
 
-        # Create rolling average features
-        windows = [6, 12, 24, 48]
-        for window in windows:
-            test_features[f'demand_rolling_{window}'] = test_features['demand'].rolling(window=window).mean()
+            if 'day_of_week' not in test_features.columns:
+                test_features['day_of_week'] = test_features['local_time'].dt.dayofweek
 
-        # Drop rows with NaN values
-        test_features = test_features.dropna()
+            if 'month' not in test_features.columns:
+                test_features['month'] = test_features['local_time'].dt.month
+
+            if 'is_weekend' not in test_features.columns:
+                test_features['is_weekend'] = test_features['day_of_week'].isin([5, 6]).astype(int)
+
+            if 'is_peak_hour' not in test_features.columns:
+                test_features['is_peak_hour'] = test_features['hour'].between(17, 21).astype(int)
+
+            # Add lag and rolling features
+            lag_periods = [1, 24, 48, 168]  # Previous hour, day, 2 days, week
+            for lag in lag_periods:
+                test_features[f'demand_lag_{lag}'] = test_features['demand'].shift(lag)
+
+            # Create rolling average features
+            windows = [6, 12, 24, 48]
+            for window in windows:
+                test_features[f'demand_rolling_{window}'] = test_features['demand'].rolling(window=window).mean()
+
+            # Drop rows with NaN values
+            test_features = test_features.dropna()
+        except Exception as e:
+            logger.error(f"Error generating features: {str(e)}", exc_info=True)
+            return jsonify({'error': f'Error generating features: {str(e)}'}), 500
 
         if len(test_features) == 0:
             return jsonify({'error': 'Insufficient data to generate forecast'}), 400
 
         # Get the feature column names from the training data
-        if hasattr(forecaster, 'X_train'):
-            feature_cols = forecaster.X_train.columns.tolist()
-        else:
-            # Default feature set
-            feature_cols = []
-            weather_cols = ['temperature', 'humidity', 'windSpeed', 'pressure',
-                            'precipIntensity', 'cloudCover']
-            for col in weather_cols:
-                if col in test_features.columns:
-                    feature_cols.append(col)
+        try:
+            if hasattr(forecaster, 'X_train') and forecaster.X_train is not None:
+                feature_cols = forecaster.X_train.columns.tolist()
+            else:
+                # Default feature set
+                feature_cols = []
+                weather_cols = ['temperature', 'humidity', 'windSpeed', 'pressure',
+                                'precipIntensity', 'cloudCover']
+                for col in weather_cols:
+                    if col in test_features.columns:
+                        feature_cols.append(col)
 
-            temporal_cols = ['hour', 'day_of_week', 'month', 'is_weekend', 'is_peak_hour']
-            for col in temporal_cols:
-                if col in test_features.columns:
-                    feature_cols.append(col)
+                temporal_cols = ['hour', 'day_of_week', 'month', 'is_weekend', 'is_peak_hour']
+                for col in temporal_cols:
+                    if col in test_features.columns:
+                        feature_cols.append(col)
 
-            # Add lag features
-            for lag in lag_periods:
-                feature_cols.append(f'demand_lag_{lag}')
+                # Add lag features
+                for lag in lag_periods:
+                    feature_cols.append(f'demand_lag_{lag}')
 
-            # Add rolling features
-            for window in windows:
-                feature_cols.append(f'demand_rolling_{window}')
+                # Add rolling features
+                for window in windows:
+                    feature_cols.append(f'demand_rolling_{window}')
 
-        # Keep only the needed feature columns
-        X_test = test_features[feature_cols]
+            logger.info(f"Using features: {feature_cols}")
+
+            # Ensure all required feature columns exist
+            missing_cols = [col for col in feature_cols if col not in test_features.columns]
+            if missing_cols:
+                return jsonify({'error': f'Missing feature columns: {missing_cols}'}), 400
+
+            # Keep only the needed feature columns
+            X_test = test_features[feature_cols]
+        except Exception as e:
+            logger.error(f"Error selecting features: {str(e)}", exc_info=True)
+            return jsonify({'error': f'Error selecting features: {str(e)}'}), 500
 
         # Scale features if scaler is available
-        if hasattr(forecaster, 'scaler') and forecaster.scaler is not None:
-            num_cols = X_test.select_dtypes(include=['number']).columns
-            X_test[num_cols] = forecaster.scaler.transform(X_test[num_cols])
+        try:
+            if hasattr(forecaster, 'scaler') and forecaster.scaler is not None:
+                num_cols = X_test.select_dtypes(include=['number']).columns
+                X_test[num_cols] = forecaster.scaler.transform(X_test[num_cols])
+        except Exception as e:
+            logger.error(f"Error scaling features: {str(e)}", exc_info=True)
+            return jsonify({'error': f'Error scaling features: {str(e)}'}), 500
 
         # Make predictions
-        if model_name == 'lstm':
-            # For LSTM, reshape data first
-            X_test_lstm = X_test.values.reshape((X_test.shape[0], 1, X_test.shape[1]))
-            forecast_demand = forecaster.models[model_name].predict(X_test_lstm).flatten()
-        else:
-            forecast_demand = forecaster.models[model_name].predict(X_test)
+        try:
+            if model_name == 'lstm':
+                # For LSTM, reshape data first
+                X_test_lstm = X_test.values.reshape((X_test.shape[0], 1, X_test.shape[1]))
+                forecast_demand = forecaster.models[model_name].predict(X_test_lstm).flatten()
+            else:
+                forecast_demand = forecaster.models[model_name].predict(X_test)
 
-        actual_demand = test_features['demand'].values
+            actual_demand = test_features['demand'].values
 
-        # Calculate metrics
-        mae = float(np.mean(np.abs(actual_demand - forecast_demand)))
-        rmse = float(np.sqrt(np.mean((actual_demand - forecast_demand) ** 2)))
-        mape = float(np.mean(np.abs((actual_demand - forecast_demand) / actual_demand)) * 100)
+            # Calculate metrics
+            mae = float(np.mean(np.abs(actual_demand - forecast_demand)))
+            rmse = float(np.sqrt(np.mean((actual_demand - forecast_demand) ** 2)))
+            mape = float(np.mean(np.abs((actual_demand - forecast_demand) / (
+                        actual_demand + 1e-10))) * 100)  # Add small epsilon to avoid division by zero
+
+            logger.info(f"Forecast completed with MAE: {mae:.2f}, RMSE: {rmse:.2f}, MAPE: {mape:.2f}%")
+        except Exception as e:
+            logger.error(f"Error making predictions: {str(e)}", exc_info=True)
+            return jsonify({'error': f'Error making predictions: {str(e)}'}), 500
 
         # Format response
         response = {
@@ -276,10 +366,51 @@ def get_forecast():
         return jsonify({'error': str(e)}), 500
 
 
+# Add missing load_models method to ElectricityDemandForecaster
+def add_load_models_method():
+    """Add load_models method if it doesn't exist"""
+    if not hasattr(ElectricityDemandForecaster, 'load_models'):
+        def load_models(self, directory='models'):
+            """Load saved models from directory"""
+            self.models = {}
+            for filename in os.listdir(directory):
+                if filename.endswith('.pkl') and not filename.startswith('scaler'):
+                    model_name = filename.split('.')[0]
+                    self.models[model_name] = joblib.load(os.path.join(directory, filename))
+
+            # Load scaler if available
+            scaler_path = os.path.join(directory, 'scaler.pkl')
+            if os.path.exists(scaler_path):
+                self.scaler = joblib.load(scaler_path)
+
+            return self.models
+
+        ElectricityDemandForecaster.load_models = load_models
+
+    # Add save_models method if it doesn't exist
+    if not hasattr(ElectricityDemandForecaster, 'save_models'):
+        def save_models(self, directory='models'):
+            """Save trained models to directory"""
+            os.makedirs(directory, exist_ok=True)
+
+            for model_name, model in self.models.items():
+                model_path = os.path.join(directory, f"{model_name}.pkl")
+                joblib.dump(model, model_path)
+
+            # Save scaler if available
+            if hasattr(self, 'scaler') and self.scaler is not None:
+                scaler_path = os.path.join(directory, 'scaler.pkl')
+                joblib.dump(self.scaler, scaler_path)
+
+        ElectricityDemandForecaster.save_models = save_models
+
+
 @app.route('/api/clusters', methods=['POST'])
 def get_clusters():
     """Get demand clusters for a city"""
     try:
+        global forecaster, data
+
         data = request.json
 
         # Validate required parameters
@@ -291,6 +422,9 @@ def get_clusters():
         n_clusters = int(data['n_clusters'])
 
         # Load data if needed
+        if forecaster is None:
+            forecaster = ElectricityDemandForecaster(data_path=DATA_PATH)
+
         if forecaster.data is None:
             forecaster.load_data()
 
@@ -306,9 +440,7 @@ def get_clusters():
         if len(df) == 0:
             return jsonify({'error': f"No data found for city: {city}"}), 404
 
-        # Prepare data for clustering (use demand data by hour of day and day of week)
-        # This is a simplified approach - in a real system we'd perform proper clustering
-
+        # Prepare data for clustering
         try:
             from sklearn.cluster import KMeans
             from sklearn.preprocessing import StandardScaler
@@ -378,6 +510,8 @@ def get_clusters():
 def train_model():
     """Train a new model for a city"""
     try:
+        global forecaster
+
         data = request.json
 
         # Validate required parameters
@@ -391,6 +525,11 @@ def train_model():
         # Optional parameters
         test_size = data.get('test_size', 0.2)
         save_model = data.get('save_model', True)
+
+        # Ensure forecaster is initialized
+        if forecaster is None:
+            forecaster = ElectricityDemandForecaster(data_path=DATA_PATH)
+            forecaster.load_data()
 
         # Validate model type
         valid_models = ['linear', 'random_forest', 'gradient_boosting', 'xgboost',
@@ -495,21 +634,29 @@ def train_model():
 def health_check():
     """Simple health check endpoint"""
     try:
+        global forecaster
+
+        # Initialize forecaster if needed
+        if forecaster is None:
+            forecaster = ElectricityDemandForecaster(data_path=DATA_PATH)
+
         return jsonify({
             'status': 'healthy',
             'timestamp': datetime.now().isoformat(),
             'app': 'Electricity Demand Forecaster API',
             'data_loaded': forecaster is not None and forecaster.data is not None,
-            'models_loaded': forecaster is not None and hasattr(forecaster, 'models') and len(forecaster.models) > 0
+            'models_loaded': forecaster is not None and hasattr(forecaster, 'models') and
+                             forecaster.models is not None and len(forecaster.models) > 0
         })
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
 
 
+# Add the missing methods before starting the app
+add_load_models_method()
+
 if __name__ == '__main__':
-    # Initialize the application
-    initialize()
 
     # Run the Flask app
     app.run(debug=True, port=5000)

@@ -25,8 +25,9 @@ import {
 } from "recharts";
 import { ScatterChart, Scatter, ZAxis } from "recharts";
 
+
 // API URL - Replace with your backend URL
-const API_URL = "http://127.0.0.1:5000/api/";
+const API_URL = "http://127.0.0.1:5000/api";
 
 function App() {
   // State for form inputs
@@ -203,7 +204,7 @@ function App() {
   ];
 
   return (
-    <Container fluid className="app-container">
+    <Container fluid className="app-container text-black">
       <Row className="header mb-4">
         <Col>
           <h1>Electricity Demand Analysis</h1>
@@ -840,5 +841,3 @@ function App() {
 }
 
 export default App;
-
-/* App.css - Add these styles to your CSS file */
